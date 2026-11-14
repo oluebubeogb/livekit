@@ -1,0 +1,77 @@
+# LiveKit SFU (audio / video / screen share) as its own Coolify resource.
+# Reusable by any app: each app gets its own API key + secret in LIVEKIT_KEYS.
+#
+# Coolify: New Resource -> (Private/Public) Repository -> Build Pack "Docker Compose",
+#          branch main, Docker Compose Location "/docker-compose.yml".
+#          Set the env vars from .env.example, then the domain on service "livekit":
+#          https://rtc.1venue.live:7880   (see README.md)
+#
+# The LiveKit config is generated from env vars right here (LIVEKIT_CONFIG), so there is no
+# file to mount and nothing secret is committed. Reference copy: livekit.yaml.example.
+services:
+  livekit:
+    image: livekit/livekit-server:${LIVEKIT_VERSION:-v1.13.11}
+    restart: unless-stopped
+    # Host networking = LiveKit gets the real UDP/TCP ports with no Docker NAT (LiveKit's
+    # recommended production setup). Coolify's proxy reaches signalling on <host>:7880.
+    # Can't use host mode? See README "Option A: published ports".
+    network_mode: host
+    environment:
+      # One app:   LIVEKIT_KEYS=APIabc123: secret...
+      # Several:   LIVEKIT_KEYS={APIabc123: secret1, APIdef456: secret2}   (YAML map on one line)
+      LIVEKIT_KEYS: ${LIVEKIT_KEYS:?Set LIVEKIT_KEYS (see .env.example)}
+      LIVEKIT_CONFIG: |
+        port: 7880                         # HTTP + WebSocket signalling (behind Coolify's HTTPS proxy)
+        bind_addresses: [""]
+        log_level: ${LIVEKIT_LOG_LEVEL:-info}
+        rtc:
+          tcp_port: 7881                   # ICE/TCP fallback when UDP is blocked (open on the firewall)
+          port_range_start: ${RTC_PORT_START:-50000}   # WebRTC media over UDP (open on the firewall)
+          port_range_end: ${RTC_PORT_END:-60000}
+          use_external_ip: ${USE_EXTERNAL_IP:-false}   # true = discover the public IP via STUN
+          node_ip: ${NODE_IP:?Set NODE_IP to the server's public IPv4}
+          congestion_control:
+            enabled: true
+            allow_pause: true
+        room:
+          empty_timeout: 300               # close rooms nobody joined after 5 min
+          departure_timeout: 20            # close rooms 20 s after the last person leaves
+          max_participants: ${LIVEKIT_MAX_PARTICIPANTS:-0}   # 0 = unlimited
+          auto_create: true
+        turn:
+          enabled: true
+          domain: ${TURN_DOMAIN:-turn.1venue.live}   # only used for TURN/TLS (clients get turns:<domain>:443)
+          udp_port: 3478                   # TURN/UDP, advertised by IP, no certificate needed
+          relay_range_start: ${TURN_RELAY_START:-30000}
+          relay_range_end: ${TURN_RELAY_END:-30100}
+          # TURN/TLS is off by default (0). To enable it set TURN_TLS_PORT=5349 and route
+          # turn.<domain>:443 through Coolify's Traefik to 127.0.0.1:5349 (README "TURN over TLS").
+          tls_port: ${TURN_TLS_PORT:-0}
+          external_tls: true               # Traefik terminates TLS; LiveKit receives plain TCP
+        # Multi-node later: point every node at the same Redis and LiveKit routes rooms across them.
+        # redis:
+        #   address: ${LIVEKIT_REDIS_ADDRESS:-127.0.0.1:6379}
+        #   password: ${LIVEKIT_REDIS_PASSWORD:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7880/ | grep -q OK || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${LIVEKIT_MEM_LIMIT:-2g}
+
+  # Optional Redis for running several LiveKit nodes later. Uncomment, set LIVEKIT_REDIS_PASSWORD,
+  # and uncomment the redis: block above. For real multi-node, every node must reach ONE shared
+  # Redis over a private network, so usually you run it once, not on every node.
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   command: ["redis-server", "--bind", "127.0.0.1", "--port", "6379", "--requirepass", "${LIVEKIT_REDIS_PASSWORD:?set}", "--save", "", "--appendonly", "no"]
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 256m
